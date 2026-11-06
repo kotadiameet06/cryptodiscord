@@ -6,6 +6,7 @@ Conditions (all must be true at the same time):
   1. USDT perpetual contract, in the top-N 24h gainers, 24h change > MIN_24H_GAIN
   2. 15m Supertrend is RED (downtrend)
   3. 15m EMA12 < EMA48
+  4. Price is more than HTF_MIN_GAP % ABOVE the 1h EMA48 (on by default)
 
 A signal fires once, at the moment all conditions become true.
 It does NOT place trades. Signals only. Uses public market data, no API keys.
@@ -38,6 +39,10 @@ EMA_FAST = 12
 EMA_SLOW = 48
 ST_PERIOD = 10                                          # Supertrend ATR length
 ST_MULT = 3.0                                           # Supertrend multiplier
+# Higher-timeframe filter: price must be more than HTF_MIN_GAP % above the 1h EMA48
+USE_HTF_FILTER = os.getenv("USE_HTF_FILTER", "true").lower() == "true"
+HTF_EMA = 48
+HTF_MIN_GAP = float(os.getenv("HTF_MIN_GAP", 2.0))      # % above the 1h EMA48
 KLINE_LIMIT = 300
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 20))     # seconds between scans
@@ -106,7 +111,8 @@ def get_json(path, params=None, retries=3):
 # Each adapter provides:
 #   symbols() -> set of native ids (USDT perpetuals), or None on failure
 #   gainers(perp) -> list of {id, name, change, price}, sorted by gain desc
-#   klines(id) -> list of [open, high, low, close] oldest -> newest (last = forming)
+#   klines(id, tf) -> list of [open, high, low, close] oldest -> newest (last = forming)
+#                     tf is '15m' or '1h'
 #   url(id) -> link to the trading page
 
 # ---- Bybit (v5, linear USDT perpetuals) ----
@@ -144,9 +150,10 @@ def bybit_gainers(perp):
     return rows
 
 
-def bybit_klines(sym):
+def bybit_klines(sym, tf="15m"):
     d = get_json("/v5/market/kline", {"category": "linear", "symbol": sym,
-                                      "interval": "15", "limit": KLINE_LIMIT})
+                                      "interval": {"15m": "15", "1h": "60"}[tf],
+                                      "limit": KLINE_LIMIT})
     if not d or d.get("retCode") != 0:
         return None
     rows = d["result"]["list"][::-1]            # API is newest-first
@@ -178,8 +185,9 @@ def okx_gainers(perp):
     return rows
 
 
-def okx_klines(inst):
-    d = get_json("/api/v5/market/candles", {"instId": inst, "bar": "15m",
+def okx_klines(inst, tf="15m"):
+    d = get_json("/api/v5/market/candles", {"instId": inst,
+                                            "bar": {"15m": "15m", "1h": "1H"}[tf],
                                             "limit": KLINE_LIMIT})
     if not d or d.get("code") != "0":
         return None
@@ -208,8 +216,8 @@ def binance_gainers(perp):
             for t in d if t["symbol"] in perp]
 
 
-def binance_klines(sym):
-    d = get_json("/fapi/v1/klines", {"symbol": sym, "interval": "15m",
+def binance_klines(sym, tf="15m"):
+    d = get_json("/fapi/v1/klines", {"symbol": sym, "interval": tf,
                                      "limit": KLINE_LIMIT})
     if not d:
         return None
@@ -233,8 +241,8 @@ def top_gainers(perp):
     return [r for r in rows[:TOP_N] if r["change"] > MIN_24H_GAIN]
 
 
-def get_klines(sym):
-    rows = _klines(sym)
+def get_klines(sym, tf="15m"):
+    rows = _klines(sym, tf)
     if not rows:
         return None
     if not USE_LIVE_CANDLE:
@@ -297,12 +305,27 @@ def evaluate(sym):
     ema_f = df["close"].ewm(span=EMA_FAST, adjust=False).mean().iloc[-1]
     ema_s = df["close"].ewm(span=EMA_SLOW, adjust=False).mean().iloc[-1]
     line, direction = supertrend(df)
+    close = float(df["close"].iloc[-1])
+    ok = bool(direction[-1] == -1 and ema_f < ema_s)
+
+    htf_ema, gap = None, None
+    if ok and USE_HTF_FILTER:               # fetch 1h data only if 15m conditions pass
+        dfh = get_klines(sym, "1h")
+        if dfh is None:                     # e.g. coin too new for a reliable 1h EMA48
+            ok = False
+        else:
+            htf_ema = float(dfh["close"].ewm(span=HTF_EMA, adjust=False).mean().iloc[-1])
+            gap = (close / htf_ema - 1) * 100
+            ok = close > htf_ema and gap > HTF_MIN_GAP
+
     return {
-        "ok": bool(direction[-1] == -1 and ema_f < ema_s),
+        "ok": ok,
         "st_line": float(line[-1]),
         "ema_f": float(ema_f),
         "ema_s": float(ema_s),
-        "close": float(df["close"].iloc[-1]),
+        "close": close,
+        "htf_ema": htf_ema,
+        "gap": gap,
     }
 
 
@@ -337,6 +360,10 @@ def fmt(p):
 
 
 def send_signal(g, res):
+    htf_line = ""
+    if res.get("gap") is not None:
+        htf_line = (f"**1h EMA{HTF_EMA}:** {fmt(res['htf_ema'])} "
+                    f"(price {res['gap']:+.2f}% above)\n")
     embed = {
         "title": f"🔴 SHORT SIGNAL: {g['name']}",
         "color": 0xE74C3C,
@@ -344,7 +371,8 @@ def send_signal(g, res):
             f"**24h change:** +{g['change']:.2f}%\n"
             f"**Price:** {fmt(res['close'])}\n"
             f"**{TF_LABEL} Supertrend:** RED (level {fmt(res['st_line'])})\n"
-            f"**EMA{EMA_FAST}:** {fmt(res['ema_f'])}  <  **EMA{EMA_SLOW}:** {fmt(res['ema_s'])}\n\n"
+            f"**EMA{EMA_FAST}:** {fmt(res['ema_f'])}  <  **EMA{EMA_SLOW}:** {fmt(res['ema_s'])}\n"
+            f"{htf_line}\n"
             f"[Open on {EXCHANGE.capitalize()}]({trade_url(g['id'])})"
         ),
         "footer": {"text": f"Data: {EXCHANGE}. Signal only - not financial advice."},
@@ -393,8 +421,9 @@ def main():
     last_signal = {}        # id -> unix time of last signal
     first_scan = True
 
+    htf_txt = (f" + price >{HTF_MIN_GAP}% above 1h EMA{HTF_EMA}" if USE_HTF_FILTER else "")
     send_discord(content=f"✅ Short scanner online ({EXCHANGE}). Gainers > {MIN_24H_GAIN}% | "
-                         f"{TF_LABEL} Supertrend red + EMA{EMA_FAST}<EMA{EMA_SLOW}")
+                         f"{TF_LABEL} Supertrend red + EMA{EMA_FAST}<EMA{EMA_SLOW}{htf_txt}")
     log.info("Started on %s. Scanning every %ss", EXCHANGE, SCAN_INTERVAL)
 
     while True:
