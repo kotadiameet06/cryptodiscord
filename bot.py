@@ -348,7 +348,7 @@ def send_signal(g, res):
             f"[Open on {EXCHANGE.capitalize()}]({trade_url(g['id'])})"
         ),
         "footer": {"text": f"Data: {EXCHANGE}. Signal only - not financial advice."},
-        "timestamp": pd.Timestamp.utcnow().isoformat(),
+        "timestamp": pd.Timestamp.now("UTC").isoformat(),
     }
     send_discord(embed=embed)
     log.info("SIGNAL sent for %s", g["name"])
