@@ -13,7 +13,9 @@ It does NOT place trades. Signals only.
 import logging
 import os
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -231,8 +233,34 @@ def send_signal(sym, change, res):
     log.info("SIGNAL sent for %s", sym)
 
 
+# ------------------- Keep-alive web server (Render) -------------------
+class _Ping(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"bot running")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+def start_web_server():
+    port = os.getenv("PORT")
+    if not port:
+        return
+    server = HTTPServer(("0.0.0.0", int(port)), _Ping)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info("Health server listening on port %s", port)
+
+
 # ------------------------------ Main ----------------------------------
 def main():
+    start_web_server()
     perp = load_perp_symbols()
     while not perp:
         log.error("Could not load exchange info, retrying in 15s")
