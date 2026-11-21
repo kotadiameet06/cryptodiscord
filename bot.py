@@ -1,12 +1,11 @@
 """
-Perpetual-futures SHORT signal scanner -> Discord bot
+USDT-perpetual 7-DAY-HIGH scanner -> Discord bot
 Exchanges (set EXCHANGE env var): bybit (default) | okx | binance
 
 Strategy:
-  - Watch the top-N 24h gainers among USDT perpetuals (no minimum % gain)
-  - Alert when a 5m candle CLOSES below the EMA288 while the 5m Supertrend is RED
-  - The alert fires once, on the first closed candle where both are true
-    (it does not matter which of the two happened first)
+  - Universe: top-N 24h gainers among USDT perpetuals whose 24h change is above MIN_24H_GAIN (5%)
+  - Alert when the 5m candle makes a NEW HIGH above the highest high of the previous ~7 days
+    (live candle by default, so the alert comes the moment the high is made)
 
 Signals only. It does NOT place trades. Uses public market data, no API keys.
 """
@@ -20,8 +19,6 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import numpy as np
-import pandas as pd
 import requests
 
 # ----------------------------- CONFIG ---------------------------------
@@ -32,27 +29,30 @@ BASES = {
     "binance": "https://fapi.binance.com",
 }
 
-TOP_N = int(os.getenv("TOP_N", 20))                     # watch the top N 24h gainers
-_mg = os.getenv("MIN_24H_GAIN", "").strip()
-MIN_24H_GAIN = float(_mg) if _mg else None              # optional; empty = no minimum
+TOP_N = int(os.getenv("TOP_N", 20))                     # watch the top N 24h gainers...
+MIN_24H_GAIN = float(os.getenv("MIN_24H_GAIN", 5.0))    # ...with 24h change above this %
+LOOKBACK_DAYS = float(os.getenv("LOOKBACK_DAYS", 7))    # "7-day high"
 
-TF_LABEL = "5m"
-TF_MS = 5 * 60 * 1000
-EMA_LEN = int(os.getenv("EMA_LEN", 288))                # EMA length on 5m candles
-ST_PERIOD = int(os.getenv("ST_PERIOD", 12))             # Supertrend ATR length
-ST_MULT = float(os.getenv("ST_MULT", 3.0))              # Supertrend multiplier
-HISTORY = int(os.getenv("HISTORY_CANDLES", 900))        # candles loaded per coin (EMA288 needs a long warm-up)
-UPDATE_CANDLES = 10                                     # small refresh once a new candle closes
-CLOSE_DELAY_S = 2                                       # wait a moment after the candle boundary
+# True  = check the still-forming 5m candle (alert the moment a new 7d high prints)
+# False = check only closed 5m candles (alert up to 5 min later, fewer false alarms)
+USE_LIVE_CANDLE = os.getenv("USE_LIVE_CANDLE", "true").lower() == "true"
+# True = skip coins with less than LOOKBACK_DAYS of history (a new listing has no real 7d high)
+REQUIRE_FULL_WINDOW = os.getenv("REQUIRE_FULL_WINDOW", "true").lower() == "true"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))     # seconds between scans
-COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", 30))       # min minutes between signals per coin
+COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", 30))       # min minutes between alerts per coin
 # Debug: comma-separated coins to explain in the logs, e.g. DEBUG_SYMBOLS=IDOLUSDT
 DEBUG_SYMBOLS = {x.strip().upper() for x in os.getenv("DEBUG_SYMBOLS", "").split(",") if x.strip()}
 
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 DISCORD_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID", "")
 # ----------------------------------------------------------------------
+
+TF5_MS = 5 * 60 * 1000
+HOUR_MS = 60 * 60 * 1000
+WINDOW_MS = int(LOOKBACK_DAYS * 24 * HOUR_MS)
+HOURLY_LIMIT = int(LOOKBACK_DAYS * 24) + 12             # 1h candles used for the long baseline
+FIVE_LIMIT = 40                                         # recent 5m candles (~3.3h)
 
 if EXCHANGE not in BASES:
     sys.exit(f"Unknown EXCHANGE '{EXCHANGE}'. Use bybit, okx or binance.")
@@ -64,7 +64,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 session = requests.Session()
-session.headers.update({"User-Agent": "short-signal-bot/3.0"})
+session.headers.update({"User-Agent": "high-scanner-bot/4.0"})
 
 _last_alert = 0.0
 
@@ -108,8 +108,8 @@ def get_json(path, params=None, retries=3):
 # Each adapter provides:
 #   symbols() -> set of native ids (USDT perpetuals), or None on failure
 #   gainers(perp) -> list of {id, name, change, price}
-#   klines(id, limit) -> [[ts_ms, open, high, low, close], ...] oldest -> newest (5m candles,
-#                        the last one is the still-forming candle)
+#   klines(id, tf, limit) -> [[ts_ms, open, high, low, close], ...] oldest -> newest
+#                            tf is "5m" or "1h"; the last candle is the still-forming one
 #   url(id) -> link to the trading page
 
 # ---- Bybit (v5, linear USDT perpetuals) ----
@@ -144,9 +144,10 @@ def bybit_gainers(perp):
             for t in d["result"]["list"] if t["symbol"] in perp]
 
 
-def bybit_klines(sym, limit):
+def bybit_klines(sym, tf, limit):
     d = get_json("/v5/market/kline", {"category": "linear", "symbol": sym,
-                                      "interval": "5", "limit": min(limit, 1000)})
+                                      "interval": {"5m": "5", "1h": "60"}[tf],
+                                      "limit": min(limit, 1000)})
     if not d or d.get("retCode") != 0:
         return None
     rows = d["result"]["list"][::-1]            # API is newest-first
@@ -178,24 +179,14 @@ def okx_gainers(perp):
     return rows
 
 
-def okx_klines(inst, limit):
-    out, after = [], None
-    while len(out) < limit:
-        want = min(300, limit - len(out))
-        params = {"instId": inst, "bar": "5m", "limit": want}
-        if after:
-            params["after"] = after             # records older than this timestamp
-        d = get_json("/api/v5/market/candles", params)
-        if not d or d.get("code") != "0":
-            break
-        data = d["data"]                        # newest-first
-        if not data:
-            break
-        out.extend([[int(r[0]), r[1], r[2], r[3], r[4]] for r in data])
-        after = data[-1][0]
-        if len(data) < want:
-            break
-    return out[::-1] or None
+def okx_klines(inst, tf, limit):
+    d = get_json("/api/v5/market/candles", {"instId": inst,
+                                            "bar": {"5m": "5m", "1h": "1H"}[tf],
+                                            "limit": min(limit, 300)})
+    if not d or d.get("code") != "0" or not d["data"]:
+        return None
+    rows = d["data"][::-1]                      # API is newest-first
+    return [[int(r[0]), r[1], r[2], r[3], r[4]] for r in rows]
 
 
 # ---- Binance (USD-M futures) ----
@@ -219,8 +210,8 @@ def binance_gainers(perp):
             for t in d if t["symbol"] in perp]
 
 
-def binance_klines(sym, limit):
-    d = get_json("/fapi/v1/klines", {"symbol": sym, "interval": "5m",
+def binance_klines(sym, tf, limit):
+    d = get_json("/fapi/v1/klines", {"symbol": sym, "interval": tf,
                                      "limit": min(limit, 1500)})
     if not d:
         return None
@@ -241,119 +232,100 @@ _last_rank = []
 
 
 def top_gainers(perp):
-    """Top-N 24h gainers (optionally above MIN_24H_GAIN)."""
+    """Top-N 24h gainers whose 24h change is above MIN_24H_GAIN."""
     global _last_rank
     rows = _gainers(perp)
     rows.sort(key=lambda x: x["change"], reverse=True)
     _last_rank = rows
-    rows = rows[:TOP_N]
-    if MIN_24H_GAIN is not None:
-        rows = [r for r in rows if r["change"] > MIN_24H_GAIN]
-    return rows
+    return [r for r in rows[:TOP_N] if r["change"] > MIN_24H_GAIN]
 
 
-# ------------------------- Candle cache -------------------------------
-# History is downloaded once per coin; afterwards only a few recent candles are
-# fetched, and only after a new 5m candle should have closed. This keeps the
-# request count tiny and gives the EMA288 a long warm-up (matches charts better).
-cache = {}      # id -> {open_ts_ms: (open, high, low, close)}
+# ------------------------- Candle caches ------------------------------
+# Baseline = highest high of the past ~7 days. To keep requests tiny it is built from:
+#   - completed 1h candles (one request per coin per hour), plus
+#   - recent 5m candles covering the part of the current hour not yet in a 1h candle.
+HOURLY = {}     # id -> {open_ts_ms: high}
+FIVE = {}       # id -> {open_ts_ms: high}
 
 
-def _to_map(rows):
-    return {r[0]: tuple(float(x) for x in r[1:5]) for r in rows}
+def _highs(rows):
+    return {r[0]: float(r[2]) for r in rows}
 
 
-def update_cache(sid):
-    """True = new data to evaluate (first load or a new candle), False = nothing new,
-    None = fetch failed."""
+def refresh_hourly(sid):
     now_ms = int(time.time() * 1000)
-    c = cache.get(sid)
-    if c is None or now_ms - max(c) > (UPDATE_CANDLES - 2) * TF_MS:
-        rows = _klines(sid, HISTORY)            # first load, or cache too stale
+    c = HOURLY.get(sid)
+    if c is None or now_ms >= max(c) + HOUR_MS + 5000:      # a new hour has completed
+        rows = _klines(sid, "1h", HOURLY_LIMIT)
         if not rows:
-            return None
-        cache[sid] = _to_map(rows)
+            return c is not None
+        HOURLY[sid] = _highs(rows)
+    return True
+
+
+def refresh_five(sid):
+    now_ms = int(time.time() * 1000)
+    c = FIVE.get(sid)
+    if c is None or now_ms - max(c) > 10 * TF5_MS:          # first load or stale
+        rows = _klines(sid, "5m", FIVE_LIMIT)
+        if not rows:
+            return False
+        FIVE[sid] = _highs(rows)
         return True
-    last_open = max(c)
-    if now_ms < last_open + TF_MS + CLOSE_DELAY_S * 1000:
-        return False                            # current candle has not closed yet
-    rows = _klines(sid, UPDATE_CANDLES)
+    if not USE_LIVE_CANDLE and now_ms < max(c) + TF5_MS + 2000:
+        return True                                         # no new closed candle yet
+    rows = _klines(sid, "5m", 12)
     if not rows:
-        return None
-    c.update(_to_map(rows))
-    extra = len(c) - (HISTORY + 100)
+        return False
+    c.update(_highs(rows))
+    extra = len(c) - (FIVE_LIMIT + 20)
     if extra > 0:
         for ts in sorted(c)[:extra]:
             del c[ts]
-    return max(c) != last_open
+    return True
 
 
-# --------------------------- Indicators -------------------------------
-def supertrend(high, low, close, period=ST_PERIOD, mult=ST_MULT):
-    """Returns (line, direction). direction: -1 = red/downtrend, 1 = green/uptrend."""
-    prev_close = np.roll(close, 1)
-    prev_close[0] = close[0]
-    tr = np.maximum(high - low,
-                    np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
-    atr = pd.Series(tr).ewm(alpha=1 / period, adjust=False).mean().values  # Wilder RMA
-
-    hl2 = (high + low) / 2
-    basic_upper = hl2 + mult * atr
-    basic_lower = hl2 - mult * atr
-
-    n = len(close)
-    final_upper = np.zeros(n)
-    final_lower = np.zeros(n)
-    direction = np.ones(n, dtype=int)
-    line = np.zeros(n)
-    final_upper[0], final_lower[0] = basic_upper[0], basic_lower[0]
-    line[0] = final_lower[0]
-
-    for i in range(1, n):
-        if basic_upper[i] < final_upper[i - 1] or close[i - 1] > final_upper[i - 1]:
-            final_upper[i] = basic_upper[i]
-        else:
-            final_upper[i] = final_upper[i - 1]
-
-        if basic_lower[i] > final_lower[i - 1] or close[i - 1] < final_lower[i - 1]:
-            final_lower[i] = basic_lower[i]
-        else:
-            final_lower[i] = final_lower[i - 1]
-
-        if close[i] > final_upper[i - 1]:
-            direction[i] = 1
-        elif close[i] < final_lower[i - 1]:
-            direction[i] = -1
-        else:
-            direction[i] = direction[i - 1]
-
-        line[i] = final_lower[i] if direction[i] == 1 else final_upper[i]
-
-    return line, direction
+def prior_high(sid, ts_c):
+    """Highest high in the LOOKBACK window strictly before the 5m candle that opened at ts_c."""
+    hourly, five = HOURLY[sid], FIVE[sid]
+    done = {t: h for t, h in hourly.items()
+            if t + HOUR_MS <= ts_c and t + HOUR_MS > ts_c - WINDOW_MS}
+    if not done:
+        return None, "no_hourly_data"
+    if REQUIRE_FULL_WINDOW and min(hourly) > ts_c - WINDOW_MS + HOUR_MS:
+        return None, "short_history"
+    last_end = max(done) + HOUR_MS
+    if min(five) > last_end:
+        return None, "gap_in_data"                          # never alert on incomplete data
+    best = max(done.values())
+    for t, h in five.items():
+        if last_end <= t < ts_c:
+            best = max(best, h)
+    return best, "ok"
 
 
-def evaluate(sid):
-    """Evaluate CLOSED candles only (the newest, still-forming candle is ignored)."""
-    c = cache[sid]
-    ts = sorted(c)[:-1]
-    if len(ts) < EMA_LEN + 2:
-        return {"status": "too_few", "candles": len(ts)}
-    arr = np.array([c[t] for t in ts])
-    high, low, close = arr[:, 1], arr[:, 2], arr[:, 3]
-    ema = pd.Series(close).ewm(span=EMA_LEN, adjust=False).mean().values
-    line, direction = supertrend(high, low, close)
-    cond = (close < ema) & (direction == -1)
+def check(sid):
+    if not (refresh_hourly(sid) and refresh_five(sid)):
+        return None
+    five = FIVE[sid]
+    ts = sorted(five)
+    if USE_LIVE_CANDLE:
+        ts_c = ts[-1]                                       # forming candle
+    else:
+        if len(ts) < 2:
+            return None
+        ts_c = ts[-2]                                       # last closed candle
+    prev_high, status = prior_high(sid, ts_c)
+    if status != "ok":
+        return {"status": status}
+    cur_high = five[ts_c]
     return {
         "status": "ok",
-        "closed_ts": int(ts[-1]),
-        "close": float(close[-1]),
-        "ema": float(ema[-1]),
-        "st_line": float(line[-1]),
-        "below": bool(close[-1] < ema[-1]),
-        "red": bool(direction[-1] == -1),
-        "now": bool(cond[-1]),
-        "prev": bool(cond[-2]),
-        "signal": bool(cond[-1] and not cond[-2]),   # first candle where both are true
+        "candle_ts": int(ts_c),
+        "cur_high": cur_high,
+        "prev_high": prev_high,
+        "breakout_pct": (cur_high / prev_high - 1) * 100,
+        "signal": bool(cur_high > prev_high),
     }
 
 
@@ -388,17 +360,19 @@ def fmt(p):
 
 
 def send_signal(g, rank, res):
-    closed_at = datetime.fromtimestamp((res["closed_ts"] + TF_MS) / 1000, tz=timezone.utc)
+    candle_at = datetime.fromtimestamp(res["candle_ts"] / 1000, tz=timezone.utc)
+    days = f"{LOOKBACK_DAYS:g}"
     embed = {
-        "title": f"🔴 SHORT SIGNAL: {g['name']}",
-        "color": 0xE74C3C,
+        "title": f"📈 {days}-DAY HIGH: {g['name']}",
+        "color": 0xF39C12,
         "description": (
-            f"**{TF_LABEL} candle closed below EMA{EMA_LEN}** with Supertrend RED\n\n"
-            f"**Close:** {fmt(res['close'])}\n"
-            f"**EMA{EMA_LEN}:** {fmt(res['ema'])}\n"
-            f"**Supertrend({ST_PERIOD},{ST_MULT:g}):** RED (level {fmt(res['st_line'])})\n"
+            f"**New {days}-day high on the 5m chart**\n\n"
+            f"**New high:** {fmt(res['cur_high'])}\n"
+            f"**Previous {days}d high:** {fmt(res['prev_high'])} "
+            f"(+{res['breakout_pct']:.2f}% above)\n"
+            f"**Price now:** {fmt(g['price'])}\n"
             f"**24h change:** {g['change']:+.2f}% (gainer rank #{rank})\n"
-            f"**Candle closed:** {closed_at.strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+            f"**5m candle opened:** {candle_at.strftime('%Y-%m-%d %H:%M UTC')}\n\n"
             f"[Open on {EXCHANGE.capitalize()}]({trade_url(g['id'])})"
         ),
         "footer": {"text": f"Data: {EXCHANGE}. Signal only - not financial advice."},
@@ -420,20 +394,20 @@ def debug_report(perp, info):
         if rank is None:
             log.info("DEBUG %s: no ticker data this scan", name)
             continue
-        head = (f"DEBUG {name}: 24h {_last_rank[rank - 1]['change']:+.1f}% "
-                f"(rank {rank}/{len(_last_rank)} on {EXCHANGE})")
-        if rank > TOP_N:
-            log.info("%s -> NOT scanned (outside top %d)", head, TOP_N)
+        change = _last_rank[rank - 1]["change"]
+        head = f"DEBUG {name}: 24h {change:+.1f}% (rank {rank}/{len(_last_rank)} on {EXCHANGE})"
+        if rank > TOP_N or change <= MIN_24H_GAIN:
+            log.info("%s -> NOT scanned (needs top %d and 24h > %.1f%%)", head, TOP_N, MIN_24H_GAIN)
             continue
         r = info.get(sid)
         if not r:
             log.info("%s -> waiting for candle data", head)
-        elif r["status"] == "too_few":
-            log.info("%s -> only %d closed candles, need %d for EMA%d",
-                     head, r["candles"], EMA_LEN + 2, EMA_LEN)
+        elif r["status"] != "ok":
+            log.info("%s -> skipped: %s", head, r["status"])
         else:
-            log.info("%s | last closed close<EMA%d=%s | ST red=%s | now=%s prev=%s | SIGNAL=%s",
-                     head, EMA_LEN, r["below"], r["red"], r["now"], r["prev"], r["signal"])
+            log.info("%s | candle high %s vs previous %sd high %s (%+.2f%%) | SIGNAL=%s",
+                     head, fmt(r["cur_high"]), f"{LOOKBACK_DAYS:g}", fmt(r["prev_high"]),
+                     r["breakout_pct"], r["signal"])
 
 
 # ------------------- Keep-alive web server (Render) -------------------
@@ -462,11 +436,11 @@ def start_web_server():
 
 
 # ------------------------------ Main ----------------------------------
-def safe_update(sid):
+def safe_check(sid):
     try:
-        return update_cache(sid)
+        return check(sid)
     except Exception:
-        log.exception("Candle update failed for %s", sid)
+        log.exception("Check failed for %s", sid)
         return None
 
 
@@ -479,14 +453,14 @@ def main():
         perp = load_perp_symbols()
     perp_loaded_at = time.time()
 
-    info = {}               # id -> latest evaluation
-    last_signal = {}        # id -> unix time of last signal
-    last_in_top = {}        # id -> unix time it was last in the top N
+    info = {}               # id -> latest check result
+    last_signal = {}        # id -> unix time of last alert
+    last_in_list = {}       # id -> unix time it was last a candidate
 
-    min_txt = f" above {MIN_24H_GAIN}%" if MIN_24H_GAIN is not None else ""
-    send_discord(content=f"✅ Short scanner online ({EXCHANGE}). Top {TOP_N} 24h gainers{min_txt} | "
-                         f"alert when a {TF_LABEL} candle closes below EMA{EMA_LEN} "
-                         f"with Supertrend({ST_PERIOD},{ST_MULT:g}) red")
+    send_discord(content=f"✅ 7-day-high scanner online ({EXCHANGE}). Top {TOP_N} gainers with "
+                         f"24h change > {MIN_24H_GAIN:g}% | alert when a coin makes a new "
+                         f"{LOOKBACK_DAYS:g}-day high on 5m "
+                         f"({'live candle' if USE_LIVE_CANDLE else 'closed candles'})")
     log.info("Started on %s. Scanning every %ss", EXCHANGE, SCAN_INTERVAL)
 
     while True:
@@ -503,30 +477,29 @@ def main():
             meta = {g["id"]: g for g in gainers}
 
             with ThreadPoolExecutor(max_workers=6) as ex:
-                updated = dict(zip(ids, ex.map(safe_update, ids)))
+                results = dict(zip(ids, ex.map(safe_check, ids)))
 
-            evaluated = 0
+            hits = []
             for sid in ids:
-                last_in_top[sid] = time.time()
-                if not updated.get(sid):
+                last_in_list[sid] = time.time()
+                res = results.get(sid)
+                if res is None:
                     continue
-                evaluated += 1
-                res = evaluate(sid)
                 info[sid] = res
                 if (res.get("signal")
                         and time.time() - last_signal.get(sid, 0) >= COOLDOWN_MIN * 60):
                     send_signal(meta[sid], rank_of[sid], res)
                     last_signal[sid] = time.time()
+                    hits.append(meta[sid]["name"])
 
-            for sid in list(cache):                 # forget coins that left the top N for 1h
-                if sid not in meta and time.time() - last_in_top.get(sid, 0) > 3600:
-                    cache.pop(sid, None)
-                    info.pop(sid, None)
+            for store in (HOURLY, FIVE):            # forget coins that left the list for 2h
+                for sid in list(store):
+                    if sid not in meta and time.time() - last_in_list.get(sid, 0) > 7200:
+                        store.pop(sid, None)
+                        info.pop(sid, None)
 
-            active = sorted(meta[s]["name"] for s in ids if info.get(s, {}).get("now"))
-            log.info("Scanned top %d gainers | evaluated %d new candles | cached %d | "
-                     "below EMA%d + red now: %s", len(ids), evaluated, len(cache), EMA_LEN,
-                     ", ".join(active) or "none")
+            log.info("Scanned %d candidate gainers | alerts this scan: %s",
+                     len(ids), ", ".join(hits) or "none")
             if DEBUG_SYMBOLS:
                 debug_report(perp, info)
         except Exception:
